@@ -13,7 +13,10 @@
  *   蓝牙 VDD -> 板子 3.3V，GND -> GND，TXD -> PA10（USART1_RX），RXD -> PA9（USART1_TX）
  *   ★ 蓝牙 TX/RX 必须交叉；蓝牙 LED 悬空
  *   OLED GND->GND，VCC->3.3V，SCL->PB6，SDA->PB7
- *   （PA1 上的 DHT11 保持不动，本工程不使用；PA0/PA6 蜂鸣器、PA5 LED 不变）
+ *   蜂鸣器（无源 + S8050，沿用"蜂鸣器"工程 PA6 那一路）：
+ *     PA6（TIM3_CH1）-> 1kΩ -> S8050 基极 B；E -> GND；C -> 蜂鸣器负极；
+ *     蜂鸣器正极 -> 3.3V（PA0 低音声部本工程不用，可悬空）
+ *   （PA1 上的 DHT11 保持不动，本工程不使用；PA5 LED 指示不变）
  *
  * 本程序做什么：
  *   1. HC-SR04 测距：TIM4 做 1µs 计时基准，每 200ms 测一次
@@ -28,17 +31,21 @@
  *        第三行：接收 12 发送 3       （收到字节数 / 已发状态报文数）
  *        第四行：最近 hello...        （最近收到的 11 个可打印字符）
  *   4. 每收到一个字节翻转一次 PA5（接收活动指示；原屏幕"活动"行让位给距离）
+ *   5. 蜂鸣器报警（PA6 / TIM3_CH1，2kHz）：距离 ≤100cm 开始鸣叫，越近越急促
+ *      （10cm≈每 100ms 一声，100cm≈每 1s 一声；>100cm 或无回波时静音）
  *
  * 调试方法：
  *   手在模块前移动，屏幕第一行的距离应跟着变化；对着墙看读数是否合理
  *   （HC-SR04 有效量程约 2~400cm，太近/太远都读不到）。
  *   蓝牙调试方法同"蓝牙调试"工程：手机装蓝牙串口 App，每 2 秒能看到一行
  *   带距离的状态报文（STM32 US OK n D=123cm），发文字看回显和屏幕变化。
+ *   蜂鸣器：手从远处慢慢靠近模块，鸣叫应变急促；对着空气（无回波）应静音。
  *
  * 实现说明：
  *   寄存器级操作，无 HAL 库。测距和刷屏都会阻塞主循环，所以两者都有
  *   "串口安静"条件：测量要求串口 50ms 内无数据，刷屏要求空闲 300ms 且
  *   距上次刷屏至少 400ms（连续大流量接收期间屏幕/测距会暂停，属正常取舍）。
+ *   蜂鸣器报警只改 PWM 占空比（PA6/TIM3），全程非阻塞。
  * ============================================================================ */
 
 /* ================= 寄存器定义（STM32F103，寄存器级操作） ================= */
@@ -62,6 +69,13 @@
 #define TIM4_CNT     (*(volatile uint32_t *)0x40000824u)
 #define TIM4_PSC     (*(volatile uint32_t *)0x40000828u)
 #define TIM4_ARR     (*(volatile uint32_t *)0x4000082Cu)
+
+#define TIM3_CR1     (*(volatile uint32_t *)0x40000400u)
+#define TIM3_CCMR1   (*(volatile uint32_t *)0x40000418u)
+#define TIM3_CCER    (*(volatile uint32_t *)0x40000420u)
+#define TIM3_PSC     (*(volatile uint32_t *)0x40000428u)
+#define TIM3_ARR     (*(volatile uint32_t *)0x4000042Cu)
+#define TIM3_CCR1    (*(volatile uint32_t *)0x40000434u)
 
 #define SYST_CSR     (*(volatile uint32_t *)0xE000E010u)
 #define SYST_RVR     (*(volatile uint32_t *)0xE000E014u)
@@ -88,6 +102,11 @@
 #define US_ECHO_MAX_US   25000u  /* ECHO 高电平最大宽度(µs，约 4.3m)，超过判无回波 */
 #define FLUSH_MIN_MS     400u    /* 两次刷屏的最小间隔(ms) */
 
+#define BEEP_NEAR_CM       100u  /* 距离 ≤ 此值开始鸣叫报警 */
+#define BEEP_PERIOD_PER_CM 10u   /* 报警周期斜率：每 1cm 增加 10ms（10cm→100ms，100cm→1s） */
+#define BEEP_PERIOD_MIN    100u  /* 最近的鸣叫周期下限(ms) */
+#define BEEP_ON_MS         60u   /* 每声蜂鸣时长(ms)，周期内其余时间静音 */
+
 /* ================= 全局状态 ================= */
 static uint8_t g_addr8 = OLED_ADDR8_A;   /* 当前使用的 I2C 从机地址 */
 static uint8_t g_fb[FB_SIZE];            /* 显存：1 字节 = 1 列 8 像素 */
@@ -106,6 +125,10 @@ uint32_t g_us_last_err = 0u;  /* 最近错误码：0=成功 1=无起始沿 2=回
 uint32_t g_us_cm = 0u;        /* 最近一次距离(cm) */
 uint32_t g_us_last_us = 0u;   /* 最近一次回波脉宽(µs) */
 uint32_t g_us_valid = 0u;     /* 最近一次测量是否有效（1=有效） */
+
+/* ---------- 蜂鸣器报警状态（调试器可读） ---------- */
+uint32_t g_beep_on = 0u;         /* 当前是否鸣叫（1=响） */
+uint32_t g_beep_period_ms = 0u;  /* 当前鸣叫周期(ms)，0=静音 */
 
 /* ============ 字库：16px 点阵（含中文），由 gen_font.ps1 生成 ============ */
 #include "font_data.h"
@@ -447,6 +470,27 @@ static uint32_t hcsr04_measure(uint32_t *cm)
     return 0u;
 }
 
+/* ================= 报警蜂鸣器（PA6 = TIM3_CH1 PWM，无源蜂鸣器 + S8050） =================
+ * 电路同"蜂鸣器"工程：PA6 -> 1kΩ -> S8050 基极 B；E -> GND；C -> 蜂鸣器负极；
+ * 蜂鸣器正极 -> 3.3V。2kHz（共振点附近最响）、占空比 50%，CCR1=0 即静音。 */
+static void tim3_beep_init(void)
+{
+    RCC_APB1ENR |= (1u << 1);   /* TIM3EN */
+    TIM3_PSC = 7u;              /* 8MHz / 8 = 1MHz */
+    TIM3_ARR = 499u;            /* 1MHz / 500 = 2kHz */
+    TIM3_CCMR1 = (6u << 4);     /* OC1M = PWM 模式 1 */
+    TIM3_CCER = 1u;             /* CC1E：输出使能 */
+    TIM3_CCR1 = 0u;             /* 先静音 */
+    TIM3_CR1 = 1u;              /* CEN，开始计数 */
+}
+
+/* 开/关蜂鸣（只改占空比，不阻塞） */
+static void beep_set(uint32_t on)
+{
+    TIM3_CCR1 = on ? 250u : 0u;   /* ARR=499，250/500 = 50% */
+    g_beep_on = on;
+}
+
 /* ================= 主程序 ================= */
 int main(void)
 {
@@ -456,6 +500,7 @@ int main(void)
     uint32_t last_hb = 0u;
     uint32_t last_us_ms = 0u;   /* 上次测距时刻 */
     uint32_t last_flush_ms = 0u;/* 上次刷屏时刻 */
+    uint32_t beep_base_ms = 0u; /* 本次鸣叫周期的起始时刻(ms) */
     uint32_t dirty = 1u;        /* 屏幕内容需要刷新 */
 
     /* 0. 显式初始化关键状态（双保险，不依赖 .data 段拷贝） */
@@ -472,9 +517,10 @@ int main(void)
 
     usart1_init();                          /* PA9/PA10 */
 
-    /* PA2 = TRIG 推挽输出 50MHz；PA3 = ECHO 浮空输入；PA5 = LED 推挽输出 */
-    GPIOA_CRL = (GPIOA_CRL & ~((0xFu << 8) | (0xFu << 12) | (0xFu << 20)))
-              | (0x3u << 8) | (0x4u << 12) | (0x2u << 20);
+    /* PA2 = TRIG 推挽输出；PA3 = ECHO 浮空输入；PA5 = LED 推挽输出；
+     * PA6 = 蜂鸣器 PWM（TIM3_CH1，复用推挽输出） */
+    GPIOA_CRL = (GPIOA_CRL & ~((0xFu << 8) | (0xFu << 12) | (0xFu << 20) | (0xFu << 24)))
+              | (0x3u << 8) | (0x4u << 12) | (0x2u << 20) | (0xBu << 24);
     GPIOA_BSRR = (1u << (TRIG_PIN + 16u));  /* TRIG 先给低 */
 
     GPIOB_ODR |= (1u << SCL_PIN) | (1u << SDA_PIN);         /* 先释放 I2C 总线为高 */
@@ -482,6 +528,7 @@ int main(void)
 
     systick_init();
     tim4_init();
+    tim3_beep_init();
 
     /* 2. OLED 初始化 + 全屏点亮自检 */
     oled_init();
@@ -561,7 +608,27 @@ int main(void)
             dirty = 1u;
         }
 
-        /* 4.4 刷屏：串口空闲 300ms 后、且距上次刷屏至少 400ms 才刷
+        /* 4.4 蜂鸣器报警：≤100cm 鸣叫，越近周期越短（10cm→100ms/声，100cm→1s/声）；
+         *     无回波或超 100cm 静音。周期内前 60ms 响、其余静音 */
+        {
+            uint32_t period = 0u;
+
+            if (g_us_valid && g_us_cm <= BEEP_NEAR_CM) {
+                period = g_us_cm * BEEP_PERIOD_PER_CM;
+                if (period < BEEP_PERIOD_MIN) period = BEEP_PERIOD_MIN;
+            }
+
+            if (period != 0u) {
+                if ((uint32_t)(now - beep_base_ms) >= period) beep_base_ms = now;
+                beep_set(((uint32_t)(now - beep_base_ms) < BEEP_ON_MS) ? 1u : 0u);
+            } else {
+                beep_base_ms = now;
+                beep_set(0u);
+            }
+            g_beep_period_ms = period;
+        }
+
+        /* 4.5 刷屏：串口空闲 300ms 后、且距上次刷屏至少 400ms 才刷
          *     （避免频繁刷屏期间丢串口数据；无蓝牙流量时约 2.5 次/秒） */
         if (dirty && (uint32_t)(now - g_last_rx_ms) >= 300u &&
             (uint32_t)(now - last_flush_ms) >= FLUSH_MIN_MS) {
